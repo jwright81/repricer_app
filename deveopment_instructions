@@ -1,0 +1,392 @@
+Build a full-stack eBay Repricer Web App
+
+## Objective
+
+Build a production-ready web application that automatically reprices a user’s eBay listings against approved competitor listings. The app must support user accounts, connect each user’s eBay store via OAuth, import and refresh active listings, compute min/max price bounds (based on fees, shipping, ROI), and reprice within those bounds according to user strategies. Users must review/approve suggested competitor listings before any price competition occurs.
+
+## Tech & Architecture (use defaults unless stated)
+
+* **Backend:** TypeScript + Node.js (NestJS or Express + Zod for validation).
+* **Frontend:** React + TypeScript (Next.js App Router) with Tailwind CSS.
+* **DB:** PostgreSQL + Prisma ORM (include migrations).
+* **Background jobs:** BullMQ (Redis) for scheduled/queued tasks.
+* **Auth:** Email/password + session (NextAuth or custom JWT w/ httpOnly cookies).
+* **Secrets/config:** Dotenv; never hard-code secrets. Provide `.env.example`.
+* **eBay APIs:** Use OAuth2 and the **Sell** & **Trading**/**Finding**/**Buy Browse** APIs via a clean “eBayAdapter” interface.
+
+  * Implement the adapter with pluggable search methods so we can switch between **Finding API** or **Buy Browse API** depending on access.
+  * Implement Sell Inventory/Feed calls as placeholders where needed; include mocks and real calls behind feature flags.
+* **API boundaries:** REST (JSON) under `/api/v1/*`. Use OpenAPI (Swagger) auto-docs.
+* **Security:** Input validation with Zod; RBAC (role: USER, ADMIN); rate-limit public endpoints; CSRF protection on forms; secure cookie flags.
+* **Testing:** Unit (Jest), API (supertest), e2e (Playwright). Include a seed script.
+
+## Core User Stories & Acceptance Criteria
+
+### 1) User Accounts & Login
+
+* Users can sign up (email + password), sign in, reset password via email token.
+* Sessions stored securely. Admin role toggle via DB.
+* Acceptance: Auth routes, tests, and guarded API routes exist.
+
+### 2) Connect eBay Store (OAuth2)
+
+* User clicks “Connect eBay,” completes OAuth, tokens (access + refresh) saved encrypted per user.
+* Store metadata saved (username, store id).
+* Token refresh handled automatically (scheduled job + on-demand).
+* Acceptance: Successful token exchange and refresh; errors surfaced to UI; tokens never exposed on client.
+
+### 3) Import Active Listings (initial + daily + on-demand)
+
+* On first connect: import all active listings (listingId, title, SKU, item price, shipping cost, total price = item + shipping, quantity, condition, category, item specifics).
+* Nightly job re-syncs active listings; on-demand “Sync Now” button.
+* Acceptance: Listings appear in “Products” grid with latest data; lastSyncAt updated; errors visible in an “Activity Log”.
+
+### 4) Product Min/Max Price Bounds
+
+* Each product row stores:
+
+  * **itemCost**, **shippingLabelCost**, **ebayFinalValueFeePct** (default per user, overridable per product), **roiMinPct**, **roiMinDollar** (user can set one or both; if both set, use the **higher** requirement), **minPrice**, **maxPrice** (derived or user-locked).
+* Provide **auto-calc** buttons to compute `minPrice` and `maxPrice` from:
+
+  * `priceBase = itemCost + shippingLabelCost + (ebayFinalValueFeePct * targetPrice)`
+  * ROI rules:
+
+    * Percent: `targetPrice >= priceBase * (1 + roiMinPct)`
+    * Dollar: `targetPrice >= priceBase + roiMinDollar`
+  * Choose the **greater** target from percent/dollar rule as the min bound.
+  * `maxPrice` default: `minPrice * 1.5` (editable).
+* All “Price” values mean **item price + shipping** (total ask).
+* Acceptance: UI shows current min/max; recalculates on edit; server validates bounds.
+
+### 5) Competitor Discovery & Approval
+
+* For each product, user can define competitor search **keywords** (default seed from product title; user-editable).
+* System fetches competitor listings (search by keywords + category; filter out same seller).
+* User reviews the returned candidates in a **“Competitor Matches”** tab:
+
+  * Show title, seller, total price (item + shipping), condition, feedback score, shipping speed.
+  * User **Approve** ✅ or **Deny** ❌ each. Only approved items are used for pricing decisions.
+* Store normalized competitor snapshots so we can price even if listing disappears temporarily.
+* Acceptance: Approved competitors persist; deny list prevents re-suggestion for N days.
+
+### 6) Repricing Strategy & Execution
+
+* Strategy options per product:
+
+  * **Match lowest approved competitor** total price.
+  * **Beat by amount** (e.g., `$1 lower`) or **beat by percent** (e.g., `1% lower`).
+  * **Stay above** (e.g., `$1 higher`) if ROI margin is abundant.
+  * Rounding rules: to nearest `$0.01`, `$0.05`, `$0.10`, or custom tick.
+  * Floor/ceiling enforcement: never go below `minPrice`, never above `maxPrice`.
+* Repricing formula:
+
+  * `competitorTarget = f(lowestApprovedCompetitorTotalPrice)`
+  * `candidateTotal = round(floor/ceil(competitorTarget, strategy))`
+  * `finalTotal = clamp(candidateTotal, minPrice, maxPrice)`
+  * Then split `finalTotal` into **itemPrice** and **shipping** according to the product’s shipping policy (if shipping is fixed/known, adjust itemPrice = finalTotal - shipping).
+* Reprice triggers:
+
+  * Nightly job, hourly job, and **on-demand** per product or bulk selection.
+* eBay update:
+
+  * Update listing item price via appropriate eBay Sell/Trading API.
+  * Log the change with before/after totals, chosen competitor reference, and strategy reason.
+* Acceptance: Dry-run mode shows the proposed new prices; live mode updates eBay and logs.
+
+### 7) Activity Log & Audit
+
+* Every sync, competitor import, approval/deny, and price update creates a log entry with timestamp, user, and payload snapshot.
+* UI page “Activity Log” with filters (type/date/product) + CSV export.
+
+### 8) Dashboards & Tables
+
+* **Dashboard:** KPIs (connected stores, active listings, % with min/max set, # awaiting competitor approval, last 24h price changes).
+* **Products table:** search, filter, sort; inline editing for cost/fees/ROI; bulk actions (recalc min/max, reprice dry-run/live).
+* **Competitors tab per product:** candidate list, approved list, denied list.
+* **Settings:** user default fees, default ROI rules, rounding rule, time zone, scheduling preferences.
+
+## Data Model (Prisma schema outline)
+
+Create tables and relations with indexes and constraints.
+
+```
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  passwordHash  String
+  role          String   @default("USER")
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  stores        Store[]
+  settings      UserSettings?
+  activityLogs  ActivityLog[]
+}
+
+model Store {
+  id                String   @id @default(cuid())
+  userId            String   @index
+  marketplace       String   @default("ebay")
+  ebayUsername      String
+  ebayAccountId     String?
+  accessTokenEnc    String   // encrypted
+  refreshTokenEnc   String   // encrypted
+  tokenExpiresAt    DateTime
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  user              User     @relation(fields: [userId], references: [id])
+  products          Product[]
+}
+
+model Product {
+  id                   String   @id @default(cuid())
+  storeId              String   @index
+  listingId            String   @unique
+  sku                  String?  @index
+  title                String
+  categoryId           String?
+  condition            String?
+  itemPrice            Decimal  @db.Decimal(10,2)
+  shippingPrice        Decimal  @db.Decimal(10,2)
+  totalPrice           Decimal  @db.Decimal(10,2) // item + shipping
+  quantity             Int
+  lastSyncedAt         DateTime?
+
+  // Costs & fees
+  itemCost             Decimal  @db.Decimal(10,2) @default(0)
+  shippingLabelCost    Decimal  @db.Decimal(10,2) @default(0)
+  ebayFeePct           Decimal  @db.Decimal(5,4)  @default(0.1300) // 13% default; adjustable
+
+  // ROI targets
+  roiMinPct            Decimal  @db.Decimal(5,4)  @default(0.1500) // 15% default
+  roiMinDollar         Decimal  @db.Decimal(10,2) @default(0)
+
+  // Bounds (can be auto-calculated or manually overridden)
+  minPrice             Decimal  @db.Decimal(10,2) @default(0)
+  maxPrice             Decimal  @db.Decimal(10,2) @default(0)
+  lockMinMax           Boolean  @default(false)
+
+  // Strategy
+  strategyType         String   @default("MATCH_LOWEST") // MATCH_LOWEST | BEAT_BY_AMOUNT | BEAT_BY_PERCENT | STAY_ABOVE
+  strategyAmount       Decimal? @db.Decimal(10,2)
+  strategyPercent      Decimal? @db.Decimal(5,4)
+  roundingRule         String   @default("CENT") // CENT | NICKEL | DIME | CUSTOM
+  roundingTick         Decimal? @db.Decimal(10,2)
+
+  // Keywords for competitor search
+  competitorKeywords   String   @default("")
+
+  store                Store    @relation(fields: [storeId], references: [id])
+  competitorMatches    CompetitorMatch[]
+  priceChanges         PriceChange[]
+  logs                 ActivityLog[]
+}
+
+model CompetitorMatch {
+  id                String   @id @default(cuid())
+  productId         String   @index
+  competitorListingId String  @index
+  sellerName        String
+  totalPrice        Decimal  @db.Decimal(10,2)
+  itemPrice         Decimal  @db.Decimal(10,2)
+  shippingPrice     Decimal  @db.Decimal(10,2)
+  condition         String?
+  feedbackScore     Int?
+  shippingSpeed     String?
+  status            String   @default("CANDIDATE") // CANDIDATE | APPROVED | DENIED
+  statusUntil       DateTime?
+  snapshotJson      Json
+  foundAt           DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  product           Product   @relation(fields: [productId], references: [id])
+
+  @@index([productId, status])
+}
+
+model PriceChange {
+  id             String   @id @default(cuid())
+  productId      String   @index
+  oldItemPrice   Decimal  @db.Decimal(10,2)
+  oldShipping    Decimal  @db.Decimal(10,2)
+  oldTotal       Decimal  @db.Decimal(10,2)
+  newItemPrice   Decimal  @db.Decimal(10,2)
+  newShipping    Decimal  @db.Decimal(10,2)
+  newTotal       Decimal  @db.Decimal(10,2)
+  reason         String
+  competitorRef  String?  // competitorListingId used for decision
+  dryRun         Boolean  @default(false)
+  createdAt      DateTime @default(now())
+
+  product        Product  @relation(fields: [productId], references: [id])
+}
+
+model UserSettings {
+  id                 String   @id @default(cuid())
+  userId             String   @unique
+  defaultEbayFeePct  Decimal  @db.Decimal(5,4)  @default(0.1300)
+  defaultRoiPct      Decimal  @db.Decimal(5,4)  @default(0.1500)
+  defaultRoiDollar   Decimal  @db.Decimal(10,2) @default(0)
+  roundingRule       String   @default("CENT")
+  roundingTick       Decimal? @db.Decimal(10,2)
+  timezone           String   @default("America/Chicago")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user               User     @relation(fields: [userId], references: [id])
+}
+
+model ActivityLog {
+  id         String   @id @default(cuid())
+  userId     String?  @index
+  storeId    String?  @index
+  productId  String?  @index
+  type       String   // AUTH, SYNC, COMPETITOR_DISCOVERY, COMPETITOR_APPROVAL, REPRICE_DRYRUN, REPRICE_LIVE, ERROR
+  message    String
+  metaJson   Json
+  createdAt  DateTime @default(now())
+
+  user       User?    @relation(fields: [userId], references: [id])
+  store      Store?   @relation(fields: [storeId], references: [id])
+  product    Product? @relation(fields: [productId], references: [id])
+}
+```
+
+## eBay Adapter (design it cleanly)
+
+Create an interface and a default implementation:
+
+```ts
+interface EbayAdapter {
+  getAuthUrl(state: string): string;
+  exchangeCodeForTokens(code: string): Promise<{ accessToken: string; refreshToken: string; expiresAt: Date }>;
+  refreshTokens(refreshToken: string): Promise<{ accessToken: string; refreshToken: string; expiresAt: Date }>;
+  getActiveListings(accessToken: string, params: { page: number }): Promise<{ items: ActiveListing[]; hasMore: boolean }>;
+  searchCompetitors(accessToken: string, q: string, opts: { categoryId?: string; condition?: string }): Promise<CompetitorResult[]>;
+  updateItemPrice(accessToken: string, listingId: string, newItemPrice: number): Promise<void>; // shipping is policy-based
+}
+```
+
+* Provide **two** search strategies inside `searchCompetitors`:
+
+  1. **Finding API** (public/easier): query by keywords + category; compute total = item + shipping from available fields.
+  2. **Buy Browse API** (if access granted): richer data; feature-flagged.
+* Normalize competitor results to `{listingId, seller, itemPrice, shippingPrice, totalPrice, condition, feedbackScore, shippingSpeed}`.
+
+## Pricing Math (implement exactly)
+
+1. **Total price definition:** `total = itemPrice + shippingPrice`.
+
+2. **Cost basis & ROI:**
+
+```
+fee = ebayFeePct * targetPrice
+priceBase = itemCost + shippingLabelCost + fee
+
+minRequiredByPct = priceBase * (1 + roiMinPct)
+minRequiredByDollar = priceBase + roiMinDollar
+computedMin = max(minRequiredByPct, minRequiredByDollar)
+
+minPrice = lockMinMax ? existingMin : roundToTick(computedMin)
+maxPrice = lockMinMax ? existingMax : (minPrice * 1.5 default, editable)
+```
+
+3. **Competitor strategy:**
+
+* MATCH\_LOWEST → `candidate = lowestApproved.totalPrice`
+* BEAT\_BY\_AMOUNT → `candidate = lowestApproved.totalPrice - strategyAmount`
+* BEAT\_BY\_PERCENT → `candidate = lowestApproved.totalPrice * (1 - strategyPercent)`
+* STAY\_ABOVE → `candidate = lowestApproved.totalPrice + strategyAmount`
+
+Then:
+
+```
+candidateRounded = applyRounding(candidate, roundingRule, roundingTick)
+finalTotal = clamp(candidateRounded, minPrice, maxPrice)
+```
+
+4. **Split final total into item vs shipping:**
+
+* If shipping policy sets shippingPrice fixed: `itemPrice = finalTotal - shippingPrice`
+* Else keep existing shipping, adjust item.
+* Never produce negative itemPrice.
+
+5. **Validation:**
+
+* If finalTotal < minPrice → reject with reason “Below floor”.
+* If no approved competitors → skip and log “No approved competitors”.
+
+## Background Jobs
+
+* **Token refresh job:** runs hourly; refreshes any tokens expiring within 15 minutes.
+* **Nightly listing import:** pulls active listings for every connected store.
+* **Hourly competitor discovery:** refreshes competitors for products with stale competitor data (>24h).
+* **Reprice job:** runs hourly; also supports manual trigger per product or bulk.
+* **Dead letter queue + retries:** exponential backoff on eBay errors; log to ActivityLog with `type=ERROR`.
+
+## API Endpoints (examples)
+
+* `POST /api/v1/auth/signup`, `POST /api/v1/auth/login`, `POST /api/v1/auth/forgot-password`, `POST /api/v1/auth/reset-password`
+* `GET /api/v1/ebay/connect` → returns OAuth URL
+* `GET /api/v1/ebay/callback?code=...&state=...` → handles token exchange
+* `POST /api/v1/sync/listings` → on-demand import
+* `GET /api/v1/products` (filters, search, pagination)
+* `PATCH /api/v1/products/:id` → edit cost/fees/roi/bounds/strategy
+* `POST /api/v1/products/:id/recalc-bounds`
+* `GET /api/v1/products/:id/competitors` → candidates, approved, denied
+* `POST /api/v1/products/:id/competitors/:competitorId/approve`
+* `POST /api/v1/products/:id/competitors/:competitorId/deny`
+* `POST /api/v1/reprice/dry-run` (ids\[])
+* `POST /api/v1/reprice/live` (ids\[])
+* `GET /api/v1/activity?type=&productId=&dateFrom=&dateTo=`
+
+All endpoints require auth (except login/signup/callback). Provide Swagger/OpenAPI JSON.
+
+## Frontend Pages
+
+* **/login, /signup, /forgot-password, /reset-password**
+* **/onboarding**: Connect eBay, initial sync progress.
+* **/dashboard**: KPIs + quick actions.
+* **/products**: table with columns: Title, SKU, TotalPrice, MinPrice, MaxPrice, Strategy, ROI targets, Last Sync, Status. Inline edit for costs/fees/ROI. Bulk actions: recalc, reprice (dry/live), refresh competitors.
+* **/products/\[id]**: details + “Competitors” tab with:
+
+  * **Candidates** (Approve/Deny buttons, paging)
+  * **Approved** (used for pricing, with “Remove”)
+  * **Denied** (show cooldown)
+* **/settings**: default fee %, default ROI %, ROI \$, rounding rule, rounding tick, scheduling options, time zone.
+* **/activity**: filterable log; export CSV.
+
+## DevEx & Deployment
+
+* Repo with **`/apps/api`**, **`/apps/web`**, **`/packages/shared`** (types), **`/infrastructure`** (Docker, Compose).
+* Dockerfiles for API and Web; `docker-compose.yml` with Postgres + Redis.
+* `seed.ts` to create a demo user + sample products.
+* `README.md` with setup steps; include `.env.example`.
+* GitHub Actions: lint, test, build, type-check on PRs; main branch builds Docker images.
+
+## Testing Requirements
+
+* **Unit tests:** pricing math, rounding, ROI min calculation, clamp logic.
+* **API tests:** auth guards, validation, product updates, competitor approve/deny.
+* **e2e tests:** happy path: signup → connect (mocked) → import (mocked) → approve competitor → dry-run → live repricing with audit entry.
+* Provide coverage badge.
+
+## Observability
+
+* Central error handler returns structured JSON errors.
+* Request logging (pino) with redaction of tokens.
+* Health check endpoint `/healthz`.
+* ActivityLog written for all jobs and important user actions.
+
+## Nice-to-Haves (implement if time allows)
+
+* Webhooks or polling for eBay listing changes.
+* Multi-store per user (already supported in schema).
+* Strategy templates (user-level defaults that can be applied in bulk).
+* Export/Import CSV for product settings.
+
+## What to Deliver
+
+1. A complete monorepo with backend, frontend, database schema/migrations, job workers, adapters, tests, Docker, and documentation.
+2. Mockable eBayAdapter with env flags to switch between “mock”, “Finding API”, and “Buy Browse API”.
+3. Seed data and a demo script that simulates competitor results for quick evaluation.
+4. Clear instructions to run locally with `docker-compose up` and to execute migrations & seeds.
