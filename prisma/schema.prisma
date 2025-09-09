@@ -1,0 +1,105 @@
+// Prisma schema
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum Strategy {
+  MATCH_LOWEST
+  BEAT_BY_AMOUNT
+  BEAT_BY_PERCENT
+  STAY_ABOVE
+}
+
+enum CompetitorStatus {
+  CANDIDATE
+  APPROVED
+  DENIED
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String
+  name      String?
+  role      Role     @default(USER)
+  stores    Store[]
+  logs      ActivityLog[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Store {
+  id             String   @id @default(cuid())
+  user           User     @relation(fields: [userId], references: [id])
+  userId         String
+  ebayUserName   String
+  ebayStoreId    String
+  accessToken    String
+  refreshToken   String
+  tokenExpiresAt DateTime
+  products       Product[]
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Product {
+  id                  String   @id @default(cuid())
+  store               Store    @relation(fields: [storeId], references: [id])
+  storeId             String
+  listingId           String   @unique
+  title               String
+  sku                 String?
+  itemPrice           Float
+  shippingPrice       Float
+  totalPrice          Float
+  itemCost            Float?
+  shippingLabelCost   Float?
+  ebayFinalValueFeePct Float?
+  roiMinPct           Float?
+  roiMinDollar        Float?
+  minPrice            Float?
+  maxPrice            Float?
+  strategy            Strategy @default(MATCH_LOWEST)
+  competitors         Competitor[]
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model Competitor {
+  id            String   @id @default(cuid())
+  product       Product  @relation(fields: [productId], references: [id])
+  productId     String
+  listingId     String
+  seller        String
+  itemPrice     Float
+  shippingPrice Float
+  totalPrice    Float
+  condition     String?
+  feedbackScore Int?
+  shippingSpeed String?
+  status        CompetitorStatus @default(CANDIDATE)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([productId, listingId])
+}
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  user      User?    @relation(fields: [userId], references: [id])
+  userId    String?
+  type      String
+  payload   Json
+  createdAt DateTime @default(now())
+}
